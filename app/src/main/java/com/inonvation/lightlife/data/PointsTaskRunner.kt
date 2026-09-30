@@ -169,13 +169,13 @@ class PointsTaskRunner(
             userAgent = ua,
             fields = mapOf("activityId" to activityId),
         )
-        when (res.codeInt()) {
-            0 -> {
+        when {
+            res.isOk() -> {
                 log("签到成功，当前积分：${res.dataMap()["totalIntegral"] ?: "-"}")
                 setState("signin_done", true)
                 onProgress?.invoke("signin", 1, 1)
             }
-            33001 -> {
+            res.codeInt() == 33001 -> {
                 log("今天已经签到过")
                 setState("signin_done", true)
                 onProgress?.invoke("signin", 1, 1)
@@ -268,9 +268,11 @@ class PointsTaskRunner(
                         fields = mapOf("taskCode" to taskCode),
                     )
                     val rewards = reward.rewardItems()
-                    if (reward.isOk() && rewards.isNotEmpty()) {
-                        val amount = rewards.first().int("awardNumber")
-                            ?: rewards.first().int("awardAmount")
+                    if (reward.isOk()) {
+                        val amount = rewards.firstOrNull()?.let { firstReward ->
+                            firstReward.int("awardNumber")
+                                ?: firstReward.int("awardAmount")
+                        }
                         val suffix = amount?.let { "，获得 $it 分" }.orEmpty()
                         log("$title 第${index + 1}/$remaining 次完成$suffix")
                         taskCompleted = true
@@ -422,7 +424,7 @@ class PointsTaskRunner(
     ): okhttp3.Headers {
         val path = url.substringAfter("https://userapi.qiekj.com")
         val raw =
-            "appSecret=${ApiConfig.ANDROID_SECRET}&channel=${ApiConfig.API_CHANNEL}&timestamp=$timestamp&token=$token&version=${ApiConfig.VERSION}$path"
+            "appSecret=${ApiConfig.ANDROID_SECRET}&channel=${ApiConfig.API_CHANNEL}&timestamp=$timestamp&token=$token&version=${ApiConfig.VERSION}&$path"
         val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
         val sign = digest.joinToString("") { "%02x".format(it) }
         return okhttp3.Headers.Builder()
