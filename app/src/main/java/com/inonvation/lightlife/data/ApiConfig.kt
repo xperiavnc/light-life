@@ -1,8 +1,9 @@
-﻿package com.inonvation.lightlife.data
+package com.inonvation.lightlife.data
 
 object ApiConfig {
     const val BASE_URL = "https://userapi.qiekj.com/"
-    const val VERSION = "1.60.3"
+    /** Official app API version observed in the supplied DEX bundle. */
+    const val VERSION = "1.96.1"
     const val LOGIN_CHANNEL = "android_app"
     const val API_CHANNEL = "android_app"
     const val PHONE_BRAND = "Redmi"

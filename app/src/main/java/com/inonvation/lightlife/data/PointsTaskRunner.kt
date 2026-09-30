@@ -13,6 +13,15 @@ import kotlin.jvm.Volatile
 
 class TaskCancelledException : Exception()
 
+/**
+ * Server-driven points task runner.
+ *
+ * The old implementation used fixed task codes and treated every task as
+ * task/completed. The current official client first reads task/list, then uses
+ * task/completed for ordinary tasks and task/getTaskReward for reward-video
+ * tasks. This runner follows that current response shape instead of keeping a
+ * stale task-code catalogue.
+ */
 class PointsTaskRunner(
     private val tokenProvider: () -> String?,
     private val context: Context? = null,
@@ -20,23 +29,23 @@ class PointsTaskRunner(
 ) {
     @Volatile
     var cancelled = false
+
     @Volatile
     var paused = false
+
     @Volatile
     var randomDelay = false
-    private var debugLog: DebugLogStore? = null
-    fun setDebugLog(log: DebugLogStore?) { debugLog = log }
 
-    /**
-     * 进度回调，供前台 Service 更新通知。
-     * @param stage 阶段标识：signin / app_video / alipay_video_task / alipay_video / ad_task / task_list / home_page
-     * @param current 当前已完成次数
-     * @param total 该阶段总次数（0 表示无进度概念）
-     */
+    private var debugLog: DebugLogStore? = null
+
+    fun setDebugLog(log: DebugLogStore?) {
+        debugLog = log
+    }
+
+    /** stage / current / total, consumed by the foreground service. */
     var onProgress: ((stage: String, current: Int, total: Int) -> Unit)? = null
 
     private val client = HttpClientProvider.client
-
     private val jsonAdapter: JsonAdapter<Map<String, Any?>> = MoshiProvider.instance
         .adapter(Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java))
 
@@ -46,32 +55,11 @@ class PointsTaskRunner(
 
     private fun today(): String = DateUtils.today()
 
-    /** 读取今天某个广告任务已完成的次数，跨天自动归零 */
-    private fun getAdCount(key: String): Int {
-        val prefs = statePrefs ?: return 0
-        val savedDate = prefs.getString("${key}_date", "") ?: ""
-        if (savedDate != today()) return 0
-        return prefs.getInt(key, 0)
-    }
-
-    /** 写入今天某个广告任务的完成次数 */
-    private fun setAdCount(key: String, count: Int) {
-        val prefs = statePrefs ?: return
-        prefs.edit()
-            .putInt(key, count)
-            .putString("${key}_date", today())
-            .apply()
-    }
-
-    /** 读取布尔状态（如签到、首页浏览是否完成），跨天自动归零 */
     private fun getState(key: String): Boolean {
         val prefs = statePrefs ?: return false
-        val savedDate = prefs.getString("${key}_date", "") ?: ""
-        if (savedDate != today()) return false
-        return prefs.getBoolean(key, false)
+        return prefs.getString("${key}_date", "") == today() && prefs.getBoolean(key, false)
     }
 
-    /** 写入布尔状态 */
     private fun setState(key: String, value: Boolean) {
         val prefs = statePrefs ?: return
         prefs.edit()
@@ -85,483 +73,310 @@ class PointsTaskRunner(
     }
 
     private suspend fun waitIfPaused(log: (suspend (String) -> Unit)? = null) {
-        if (paused) log?.invoke("​⏸ 任务已暂停，等待继续...")
+        if (paused) log?.invoke("\u200B⏸ 任务已暂停，等待继续...")
         while (paused) {
             delay(1000)
-            if (cancelled) throw TaskCancelledException()
+            checkCancelled()
         }
     }
 
-    /** 随机延迟 2~6 秒，仅在 randomDelay 开启时生效。显示一次延迟时间后静默等待 */
-    private suspend fun maybeRandomDelay(log: (suspend (String) -> Unit)? = null) {
-        if (randomDelay) {
-            val delayMs = 2000L + (Math.random() * 4000).toLong()
-            val delaySec = (delayMs / 1000).toInt()
-            log?.invoke("随机延迟 ${delaySec}秒")
-            delay(delayMs)
+    private suspend fun maybeDelay(log: (suspend (String) -> Unit)? = null) {
+        val delayMs = if (randomDelay) {
+            2000L + (Math.random() * 4000).toLong()
+        } else {
+            1500L
         }
-    }
-
-    /** 随机延迟 2~6 秒，仅在 randomDelay 开启时生效，每 maxCount 次循环触发一次。显示一次延迟时间后静默等待 */
-    private suspend fun maybeRandomDelayEvery(currentIndex: Int, maxCount: Int, log: (suspend (String) -> Unit)? = null) {
-        if (randomDelay && currentIndex > 0 && currentIndex % maxCount == 0) {
-            val delayMs = 2000L + (Math.random() * 4000).toLong()
-            val delaySec = (delayMs / 1000).toInt()
-            log?.invoke("随机延迟 ${delaySec}秒")
-            delay(delayMs)
-        }
-    }
-
-    /** 判断服务器返回是否表示任务已全部完成 */
-    private fun isAlreadyCompletedResponse(taskRes: Map<String, Any?>): Boolean {
-        val code = taskRes.codeInt()
-        val msg = taskRes.messageText()
-        val keys = listOf("已完成", "已结束", "完成", "已达上限", "已达今日上限", "已达最大次数", "次数已满", "今日已满")
-        if (code != 0 && keys.any { msg.contains(it) }) return true
-        if (code == 0 && taskRes["data"] != true && keys.any { msg.contains(it) }) return true
-        return false
+        if (randomDelay) log?.invoke("随机延迟 ${(delayMs / 1000).toInt()}秒")
+        delay(delayMs)
     }
 
     suspend fun run(userAgent: String, log: suspend (String) -> Unit) {
         checkCancelled()
         waitIfPaused(log)
-        // 按本地标签快进首页浏览子任务指针，今天已完成的子任务直接跳过、不重跑、不显示积分
-        homePageSubtaskIndex = getAdCount("home_page_count").coerceAtMost(homePageSubtasks.size)
         val token = tokenProvider()?.takeIf { it.isNotBlank() } ?: error("请先在我的页面登录")
 
-        val user = request("https://userapi.qiekj.com/user/info", token, userAgent, mapOf("token" to token))
+        val user = request(
+            url = "https://userapi.qiekj.com/user/info",
+            token = token,
+            userAgent = userAgent,
+            fields = emptyMap(),
+        )
         val userName = user.dataMap()["userName"]?.toString()
         log(if (userName.isNullOrBlank()) "当前账号未设置昵称" else "当前账号：$userName")
 
         var lastBalance = balance(token, userAgent)
-        val initialBalance = lastBalance  // 保存初始余额用于计算今日总增量
+        val initialBalance = lastBalance
         log("任务前积分：${lastBalance ?: "-"}")
 
-        // 本地状态检查：完成过的步骤直接跳过
-        checkCancelled()
-        if (getState("signin_done")) {
-            log("签到：已跳过")
+        if (!getState("signin_done")) {
+            val activityId = resolveSignInActivityId(token, userAgent, log)
+            signIn(token, userAgent, activityId, log)
+            lastBalance = logBalanceDelta("签到", token, userAgent, lastBalance, log)
         } else {
-            signIn(token, userAgent, log)
-            delay(2000)
-            val cur = balance(token, userAgent)
-            if (cur != null && lastBalance != null) {
-                val diff = cur - lastBalance
-                log("签到：+${diff} (${cur})")
-            } else if (cur != null) {
-                log("签到：${cur}")
-            }
-            lastBalance = cur
+            log("签到：已跳过")
         }
+
         checkCancelled()
         shieldingQuery(token, userAgent, log)
-
-        // 首页浏览第1次（5s）
-        log("首页浏览...")
-        val home1Executed = runNextHomePageSubtask(token, userAgent, log)
-        delay(1000)
-        if (home1Executed) {
-            val cur = balance(token, userAgent)
-            if (cur != null && lastBalance != null) {
-                val diff = cur - lastBalance
-                log("首页浏览 (1/3)：+${diff} (${cur})")
-            }
-            lastBalance = cur
-        }
-
         checkCancelled()
-        delay(1000)
-        lastBalance = runTaskList(token, userAgent, log, lastBalance)
+        lastBalance = runOfficialTaskList(token, userAgent, log, lastBalance)
 
-        // 首页浏览第2次（10s）
-        checkCancelled()
-        val home2Executed = runNextHomePageSubtask(token, userAgent, log)
-        delay(1000)
-        if (home2Executed) {
-            val cur = balance(token, userAgent)
-            if (cur != null && lastBalance != null) {
-                val diff = cur - lastBalance
-                log("首页浏览 (2/3)：+${diff} (${cur})")
-            }
-            lastBalance = cur
-        }
-
-        checkCancelled()
-        runRepeatableTask(RepeatableTaskConfig(
-            key = "app_video", doneState = "app_video_done", progressStage = "app_video",
-            total = 20, label = "APP视频", channel = "android_app", taskCode = "2",
-            useCompletedCheck = false, randomEveryIter = true,
-        ), token, userAgent, log)
-        delay(2000)
-        run {
-            val cur = balance(token, userAgent)
-            if (cur != null && lastBalance != null) {
-                val diff = cur - lastBalance
-                log("APP视频：+${diff} (${cur})")
-            }
-            lastBalance = cur
-        }
-
-        checkCancelled()
-        runRepeatableTask(RepeatableTaskConfig(
-            key = "alipay_video_task", doneState = "alipay_video_task_done",
-            progressStage = "alipay_video_task", total = 10, label = "支付宝视频",
-            channel = "alipay", taskCode = "dc18b525-f679-47d8-805a-e331f8f3341d",
-        ), token, userAgent, log)
-        delay(3000)
-        run {
-            val cur = balance(token, userAgent)
-            if (cur != null && lastBalance != null) {
-                val diff = cur - lastBalance
-                log("支付宝视频：+${diff} (${cur})")
-            }
-            lastBalance = cur
-        }
-
-        // 首页浏览第3次（30s）
-        checkCancelled()
-        val home3Executed = runNextHomePageSubtask(token, userAgent, log)
-        delay(1000)
-        if (home3Executed) {
-            val cur = balance(token, userAgent)
-            if (cur != null && lastBalance != null) {
-                val diff = cur - lastBalance
-                log("首页浏览 (3/3)：+${diff} (${cur})")
-            }
-            lastBalance = cur
-        }
-        setState("home_page_done", true)
-
-        checkCancelled()
-        runRepeatableTask(RepeatableTaskConfig(
-            key = "alipay_video", doneState = "alipay_video_done",
-            progressStage = "alipay_video", total = 50, label = "支付宝广告",
-            channel = "alipay", taskCode = "9",
-        ), token, userAgent, log)
-        delay(3000)
-        val after = balance(token, userAgent)
-        if (after != null && lastBalance != null) {
-            val diff = after - lastBalance
-            log("支付宝广告：+${diff} (${after})")
-        }
-        val totalGained = after?.let { a -> initialBalance?.let { b -> a - b } }
-        log("任务完成，当前积分：${after ?: "-"}（今日 +${totalGained ?: 0}）")
-        if (totalGained != null && totalGained > 0) {
-            pointsStatsStore?.addTodayEarned(totalGained)
+        val after = balance(token, userAgent) ?: lastBalance
+        val earned = if (after != null && initialBalance != null) after - initialBalance else null
+        log("任务完成，当前积分：${after ?: "-"}（今日 +${earned ?: 0}）")
+        if (earned != null && earned > 0) {
+            pointsStatsStore?.addTodayEarned(earned)
         }
     }
 
-    private suspend fun signIn(token: String, ua: String, log: suspend (String) -> Unit) {
+    private suspend fun resolveSignInActivityId(
+        token: String,
+        ua: String,
+        log: suspend (String) -> Unit,
+    ): String {
+        val response = runCatching {
+            request(
+                url = "https://userapi.qiekj.com/signin/signInActList",
+                token = token,
+                userAgent = ua,
+                fields = emptyMap(),
+            )
+        }.getOrElse {
+            log("读取签到活动失败，使用兼容活动号：$DEFAULT_SIGN_IN_ACTIVITY_ID")
+            return DEFAULT_SIGN_IN_ACTIVITY_ID
+        }
+        val activityId = response.dataMap()["id"]?.toString()
+            ?.takeIf { it.isNotBlank() }
+            ?: response.dataMap()["activityId"]?.toString()
+                ?.takeIf { it.isNotBlank() }
+        if (response.isOk() && activityId != null) {
+            return activityId
+        }
+        log("签到活动未返回有效活动号，使用兼容活动号：$DEFAULT_SIGN_IN_ACTIVITY_ID")
+        return DEFAULT_SIGN_IN_ACTIVITY_ID
+    }
+
+    private suspend fun signIn(
+        token: String,
+        ua: String,
+        activityId: String,
+        log: suspend (String) -> Unit,
+    ) {
         log("开始执行签到...")
         val res = request(
             url = "https://userapi.qiekj.com/signin/doUserSignIn",
             token = token,
             userAgent = ua,
-            fields = mapOf("activityId" to "600001", "token" to token),
+            fields = mapOf("activityId" to activityId),
         )
         when (res.codeInt()) {
-            0 -> { log("签到成功，当前积分：${res.dataMap()["totalIntegral"] ?: "-"}")
+            0 -> {
+                log("签到成功，当前积分：${res.dataMap()["totalIntegral"] ?: "-"}")
                 setState("signin_done", true)
                 onProgress?.invoke("signin", 1, 1)
             }
-            33001 -> { log("今天已经签到过"); setState("signin_done", true); onProgress?.invoke("signin", 1, 1) }
+            33001 -> {
+                log("今天已经签到过")
+                setState("signin_done", true)
+                onProgress?.invoke("signin", 1, 1)
+            }
             else -> log("签到失败：${res.messageText()}")
         }
     }
 
-    private suspend fun shieldingQuery(token: String, ua: String, log: suspend (String) -> Unit) {
-        val res = request(
-            url = "https://userapi.qiekj.com/shielding/query",
-            token = token,
-            userAgent = ua,
-            fields = mapOf("shieldingResourceType" to "1", "token" to token),
-        )
-        log("屏蔽：${res.messageText()}")
-    }
-
-    @Volatile
-    private var homePageSubtaskIndex = 0
-
-    private val homePageSubtasks = listOf(
-        "4a86e8b5-e46c-4dac-9e73-c6e3cf39c7d6" to "5s",
-        "73310f73-b076-40d5-a53f-c79c48f14d64" to "10s",
-        "f3814d95-38f0-4778-8da3-6b8e3fc113d0" to "30s",
-    )
-
-    /** 执行首页浏览的下一个子任务，返回是否真正执行了请求（false 表示已跳过） */
-    private suspend fun runNextHomePageSubtask(token: String, ua: String, log: suspend (String) -> Unit): Boolean {
-        if (homePageSubtaskIndex >= homePageSubtasks.size) {
-            log("首页浏览：已完成，跳过")
-            return false
-        }
-        val current = homePageSubtaskIndex + 1
-        val (subtaskCode, label) = homePageSubtasks[homePageSubtaskIndex]
-        val res = try {
-            request(
-                url = "https://userapi.qiekj.com/task/completed",
-                token = token,
-                userAgent = ua,
-                fields = mapOf(
-                    "taskCode" to "8b475b42-df8b-4039-b4c1-f9a0174a611a",
-                    "subtaskCode" to subtaskCode,
-                    "token" to token,
-                ),
-            )
-        } catch (e: Exception) {
-            log("首页浏览 $current/3（${label}）：请求失败 ${e.message}")
-            homePageSubtaskIndex++
-            return true
-        }
-        if (res.codeInt() == 0 && res["data"] == true) {
-            log("首页浏览 $current/3（${label}）：成功")
-        } else {
-            log("首页浏览 $current/3（${label}）：${res.messageText()}")
-        }
-        onProgress?.invoke("home_page", current, 3)
-        setAdCount("home_page_count", current)
-        homePageSubtaskIndex++
-        return true
-    }
-
-    /**
-     * 任务列表阶段，返回最新的 lastBalance。
-     * "看更多视频"和"点外卖"合并为"其他"任务标签，两者都完成才标记 other_task_done。
-     * 看广告任务识别服务器"已完成"反馈，避免重复执行。
-     * 每条任务完成后日志追加 +N 积分。
-     */
-    private suspend fun runTaskList(
-        token: String,
-        ua: String,
-        log: suspend (String) -> Unit,
-        lastBalance: Int?,
-    ): Int? {
-        var curBalance = lastBalance
-        var adTaskDiff: Int? = null
-        log("任务列表...")
-        onProgress?.invoke("task_list", 0, 0)
-        val res = request("https://userapi.qiekj.com/task/list", token, ua, mapOf("token" to token))
-        if (res.codeInt() != 0) {
-            log("获取任务列表失败：${res.messageText()}")
-            return curBalance
-        }
-        val items = (res.dataMap()["items"] as? List<*>)?.filterIsInstance<Map<String, Any?>>() ?: emptyList()
-
-        // 记录"其他"任务组的完成情况
-        var otherMoreVideoDone = getState("more_video_done")
-        var otherTakeoutDone = getState("takeout_done")
-
-        for (item in items) {
-            checkCancelled()
-            val completed = (item["completedStatus"] as? Number)?.toInt() ?: -1
-            val taskCode = item["taskCode"] ?: continue
-            val title = item["title"]?.toString().orEmpty().ifBlank { "未命名任务" }
-            val isAdTask = title == "看广告赚积分"
-            val isMoreVideoTask = title == "看更多视频赚积分"
-            val isTakeoutTask = title.contains("点外卖")
-            val isOtherTask = isMoreVideoTask || isTakeoutTask
-
-            if (isAdTask && getState("ad_task_done")) continue
-            if (isOtherTask && getState("other_task_done")) continue
-            // 非广告/非其他任务：服务器已完成则跳过
-            if (!isAdTask && !isOtherTask && (completed != 0 || taskCode.toString() in NOT_FINISH_TASKS)) continue
-
-            val limit = (item["dailyTaskLimit"] as? Number)?.toInt() ?: 1
-
-            if (isAdTask) {
-                val adLimit = 10
-                if (completed >= adLimit) {
-                    setAdCount("ad_task", adLimit)
-                    setState("ad_task_done", true)
-                    log("$title 已完成，跳过")
-                    continue
-                }
-                val adTaskDone = getAdCount("ad_task")
-                if (adTaskDone >= adLimit) {
-                    setState("ad_task_done", true)
-                    continue
-                }
-                if (adTaskDone > 0) {
-                    log("$title：继续（$adTaskDone/$adLimit）")
-                } else {
-                    log("开始执行：$title")
-                }
-            } else if (isOtherTask) {
-                log("开始执行任务：$title")
-            } else {
-                log("开始执行任务：$title")
-            }
-
-            var taskCompletedNormally = true
-            var completedCount = if (isAdTask) getAdCount("ad_task") else 0
-
-            repeat(limit) { index ->
-                checkCancelled()
-                waitIfPaused(log)
-                if (isAdTask && index < getAdCount("ad_task")) return@repeat
-                val taskRes = completeTask(token, ua, taskCode)
-                val code = taskRes.codeInt()
-                val dataVal = taskRes["data"]
-                val msg = taskRes.messageText()
-                if (code == 0 && (isAdTask || dataVal == true)) {
-                    // 广告任务：data 为 false 说明服务器认为已完成
-                    if (isAdTask && dataVal != true) {
-                        log("$title：已完成")
-                        setAdCount("ad_task", 10)
-                        setState("ad_task_done", true)
-                        taskCompletedNormally = true
-                        return@repeat
-                    }
-                    completedCount = index + 1
-                    if (isAdTask) setAdCount("ad_task", index + 1)
-                    delay(1500)
-                    // 广告任务：每次增量相同，第一次成功后调 balance 缓存，后续复用
-                    if (isAdTask) {
-                        if (adTaskDiff == null) {
-                            val cur = balance(token, ua)
-                            adTaskDiff = if (cur != null && curBalance != null) cur - curBalance else null
-                            curBalance = cur ?: curBalance
-                        }
-                        val suffix = adTaskDiff?.takeIf { it > 0 }?.let { " +$it" } ?: ""
-                        log("$title 第${index + 1}/${limit}次完成$suffix")
-                    } else {
-                        // 非广告任务：正常调 balance 算差值
-                        val cur = balance(token, ua)
-                        val diff = if (cur != null && curBalance != null) cur - curBalance else null
-                        val suffix = if (diff != null && diff > 0) " +$diff" else ""
-                        log("$title 第${index + 1}/${limit}次完成$suffix")
-                        curBalance = cur ?: curBalance
-                    }
-                    onProgress?.invoke("ad_task", index + 1, 10)
-                } else {
-                    if (isAlreadyCompletedResponse(taskRes) || msg.contains("任务已结束") || msg.contains("已结束")) {
-                        log("$title：已完成")
-                        if (isAdTask) { setAdCount("ad_task", 10); setState("ad_task_done", true) }
-                        taskCompletedNormally = true
-                    } else {
-                        log("$title 第${index + 1}/${limit}次失败：$msg")
-                        taskCompletedNormally = false
-                    }
-                    return@repeat
-                }
-                if (index < limit - 1) { delay(10_000); maybeRandomDelayEvery(index, 5, log) }
-            }
-
-            // 任务循环结束后处理本地状态
-            if (isAdTask && completedCount >= 10) {
-                setState("ad_task_done", true)
-            }
-
-            if (isMoreVideoTask && taskCompletedNormally) {
-                otherMoreVideoDone = true
-                setState("more_video_done", true)
-            }
-            if (isTakeoutTask && taskCompletedNormally) {
-                otherTakeoutDone = true
-                setState("takeout_done", true)
-            }
-            // 两者都完成时标记 other_task_done
-            if (otherMoreVideoDone && otherTakeoutDone) {
-                setState("other_task_done", true)
-            }
-
-            delay(5_000)
-            maybeRandomDelay(log)
-        }
-        // 广告任务循环结束后刷新 balance 确保返回值是最新的
-        if (adTaskDiff != null) {
-            balance(token, ua)?.let { curBalance = it }
-        }
-        return curBalance
-    }
-
-    private data class RepeatableTaskConfig(
-        val key: String,
-        val doneState: String,
-        val progressStage: String,
-        val total: Int,
-        val label: String,
-        val channel: String,
-        val taskCode: String,
-        val useCompletedCheck: Boolean = true,
-        val randomEveryIter: Boolean = false,
-    )
-
-    private suspend fun runRepeatableTask(
-        config: RepeatableTaskConfig,
+    private suspend fun shieldingQuery(
         token: String,
         ua: String,
         log: suspend (String) -> Unit,
     ) {
-        val startFrom = getAdCount(config.key)
-        if (startFrom >= config.total) {
-            log("${config.label}：已完成，跳过")
-            setState(config.doneState, true)
-            return
-        }
-        if (startFrom > 0) {
-            log("${config.label}：继续（$startFrom/${config.total}）")
-        } else {
-            log("${config.label}...")
-        }
-        var lastBalance = balance(token, ua)
-        var firstDiff: Int? = null
-        for (index in startFrom until config.total) {
-            checkCancelled()
-            val res = request(
-                url = "https://userapi.qiekj.com/task/completed",
-                token = token,
-                userAgent = ua,
-                fields = mapOf("taskCode" to config.taskCode, "token" to token),
-                channel = config.channel,
-            )
-            if (res.codeInt() == 0 && res["data"] == true) {
-                setAdCount(config.key, index + 1)
-                onProgress?.invoke(config.progressStage, index + 1, config.total)
-                delay(15_000)
-                if (config.randomEveryIter) {
-                    maybeRandomDelay(log)
-                } else {
-                    maybeRandomDelayEvery(index, 5, log)
-                }
-                // 第一次调 balance 算出单次增量，后续复用
-                if (firstDiff == null) {
-                    val cur = balance(token, ua)
-                    firstDiff = if (cur != null && lastBalance != null) cur - lastBalance else null
-                    lastBalance = cur ?: lastBalance
-                }
-                val suffix = if (firstDiff != null && firstDiff!! > 0) " +${firstDiff}" else ""
-                log("${config.label}（${index + 1}/${config.total}）$suffix")
-            } else {
-                val msg = res.messageText()
-                val code = res.codeInt()
-                if (code == 0 && res["data"] == false) {
-                    log("${config.label}：已完成")
-                    setAdCount(config.key, config.total)
-                    setState(config.doneState, true)
-                } else if ((config.useCompletedCheck && isAlreadyCompletedResponse(res)) || msg.contains("任务已结束") || msg.contains("已结束")) {
-                    log("${config.label}：已完成")
-                    setAdCount(config.key, config.total)
-                    setState(config.doneState, true)
-                } else {
-                    log("${config.label}停止：$msg")
-                }
-                return
-            }
-        }
-        // 循环全部完成，记录状态
-        setState(config.doneState, true)
+        val res = request(
+            url = "https://userapi.qiekj.com/shielding/query",
+            token = token,
+            userAgent = ua,
+            fields = mapOf("shieldingResourceType" to "1"),
+        )
+        log("屏蔽：${res.messageText()}")
     }
 
-    private suspend fun completeTask(token: String, ua: String, taskCode: Any): Map<String, Any?> = request(
-        url = "https://userapi.qiekj.com/task/completed",
-        token = token,
-        userAgent = ua,
-        fields = mapOf("taskCode" to taskCode.toString(), "token" to token),
-    )
+    /**
+     * Reads the current task catalogue and dispatches by the server-provided
+     * task type. 637/638 are the reward-video task types used by the supplied
+     * official client; all other task types use task/completed.
+     */
+    private suspend fun runOfficialTaskList(
+        token: String,
+        ua: String,
+        log: suspend (String) -> Unit,
+        initialBalance: Int?,
+    ): Int? {
+        log("读取官方任务列表...")
+        onProgress?.invoke("task_list", 0, 0)
+        val listResponse = request(
+            url = "https://userapi.qiekj.com/task/list",
+            token = token,
+            userAgent = ua,
+            fields = emptyMap(),
+        )
+        if (!listResponse.isOk()) {
+            log("获取任务列表失败：${listResponse.messageText()}")
+            return initialBalance
+        }
+
+        val items = listResponse.items()
+        if (items.isEmpty()) {
+            log("官方任务列表为空")
+            setState("tasklist_done", true)
+            return initialBalance
+        }
+
+        var currentBalance = initialBalance
+        var completedTasks = 0
+        var visibleTasks = 0
+
+        for (item in items) {
+            checkCancelled()
+            waitIfPaused(log)
+            val taskCode = item.string("taskCode")?.takeIf { it.isNotBlank() } ?: continue
+            val title = item.string("title")?.ifBlank { null } ?: "未命名任务"
+            val taskType = item.int("taskType") ?: 0
+            val completedStatus = item.int("completedStatus") ?: 0
+            val completedFreq = item.int("completedFreq") ?: 0
+            val dailyLimit = (item.int("dailyTaskLimit") ?: item.int("totalTaskLimit") ?: 1)
+                .coerceAtLeast(1)
+            val remaining = (dailyLimit - completedFreq).coerceAtLeast(1)
+            val stage = stageFor(taskType, title)
+            visibleTasks++
+
+            if (completedStatus == 1 || completedFreq >= dailyLimit) {
+                log("$title：已完成（$completedFreq/$dailyLimit）")
+                onProgress?.invoke(stage, dailyLimit, dailyLimit)
+                continue
+            }
+
+            log("开始执行：$title（$completedFreq/$dailyLimit）")
+            val subtasks = item.listOfMaps("subtaskList")
+            var taskCompleted = false
+
+            if (taskType == REWARD_VIDEO_TASK || taskType == REWARD_VIDEO_TASK_ALT) {
+                repeat(remaining) { index ->
+                    checkCancelled()
+                    waitIfPaused(log)
+                    val reward = request(
+                        url = "https://userapi.qiekj.com/task/getTaskReward",
+                        token = token,
+                        userAgent = ua,
+                        fields = mapOf("taskCode" to taskCode),
+                    )
+                    val rewards = reward.rewardItems()
+                    if (reward.isOk() && rewards.isNotEmpty()) {
+                        val amount = rewards.first().int("awardNumber")
+                            ?: rewards.first().int("awardAmount")
+                        val suffix = amount?.let { "，获得 $it 分" }.orEmpty()
+                        log("$title 第${index + 1}/$remaining 次完成$suffix")
+                        taskCompleted = true
+                    } else if (isCompletedResponse(reward)) {
+                        log("$title：服务器已记录完成")
+                        taskCompleted = true
+                        return@repeat
+                    } else {
+                        log("$title 第${index + 1}/$remaining 次失败：${reward.messageText()}")
+                        return@repeat
+                    }
+                    onProgress?.invoke(stage, index + 1, remaining)
+                    maybeDelay(log)
+                }
+            } else if (subtasks.isNotEmpty()) {
+                var subIndex = 0
+                for (subtask in subtasks) {
+                    if ((subtask.int("completedStatus") ?: 0) == 1) continue
+                    checkCancelled()
+                    waitIfPaused(log)
+                    val subtaskCode = subtask.string("subtaskCode")
+                        ?: subtask.string("taskCode")
+                        ?: continue
+                    val result = completeTask(token, ua, taskCode, subtaskCode)
+                    subIndex++
+                    if (result.isOk() || isCompletedResponse(result)) {
+                        taskCompleted = true
+                        log("$title 子任务 $subIndex 完成")
+                    } else {
+                        log("$title 子任务 $subIndex 失败：${result.messageText()}")
+                    }
+                    onProgress?.invoke(stage, subIndex, subtasks.size)
+                    maybeDelay(log)
+                }
+            } else {
+                repeat(remaining) { index ->
+                    checkCancelled()
+                    waitIfPaused(log)
+                    val result = completeTask(token, ua, taskCode, null)
+                    if (result.isOk() || isCompletedResponse(result)) {
+                        taskCompleted = true
+                        log("$title 第${index + 1}/$remaining 次完成")
+                    } else {
+                        log("$title 第${index + 1}/$remaining 次失败：${result.messageText()}")
+                        return@repeat
+                    }
+                    onProgress?.invoke(stage, index + 1, remaining)
+                    maybeDelay(log)
+                }
+            }
+
+            if (taskCompleted) {
+                completedTasks++
+                markLegacyState(title, taskType)
+                currentBalance = logBalanceDelta(title, token, ua, currentBalance, log)
+            }
+            maybeDelay(log)
+        }
+
+        setState("tasklist_done", true)
+        log("任务列表处理完成：$completedTasks/$visibleTasks 项")
+        return currentBalance
+    }
+
+    private suspend fun completeTask(
+        token: String,
+        ua: String,
+        taskCode: String,
+        subtaskCode: String?,
+    ): Map<String, Any?> {
+        val fields = buildMap {
+            put("taskCode", taskCode)
+            if (!subtaskCode.isNullOrBlank()) put("subtaskCode", subtaskCode)
+        }
+        return request(
+            url = "https://userapi.qiekj.com/task/completed",
+            token = token,
+            userAgent = ua,
+            fields = fields,
+        )
+    }
+
+    private suspend fun logBalanceDelta(
+        label: String,
+        token: String,
+        ua: String,
+        previous: Int?,
+        log: suspend (String) -> Unit,
+    ): Int? {
+        val current = balance(token, ua)
+        if (current != null && previous != null) {
+            log("$label：+${current - previous}（$current）")
+        } else if (current != null) {
+            log("$label：$current")
+        }
+        return current ?: previous
+    }
 
     private suspend fun balance(token: String, ua: String): Int? {
-        val res = request("https://userapi.qiekj.com/user/balance", token, ua, mapOf("token" to token))
-        return (res.dataMap()["integral"] as? Number)?.toInt()
+        val res = request(
+            url = "https://userapi.qiekj.com/user/balance",
+            token = token,
+            userAgent = ua,
+            fields = emptyMap(),
+        )
+        return res.dataMap()["integral"].asInt()
     }
 
     private suspend fun request(
@@ -569,28 +384,31 @@ class PointsTaskRunner(
         token: String,
         userAgent: String,
         fields: Map<String, String>,
-        channel: String = "android_app",
     ): Map<String, Any?> {
         val timestamp = System.currentTimeMillis().toString()
+        val actualFields = if (fields.containsKey("token")) fields else fields + ("token" to token)
         val form = FormBody.Builder().apply {
-            fields.forEach { (key, value) -> add(key, value) }
+            actualFields.forEach { (key, value) -> add(key, value) }
         }.build()
         val req = Request.Builder()
             .url(url)
             .post(form)
-            .headers(headers(url, token, userAgent, timestamp, channel))
+            .headers(headers(url, token, userAgent, timestamp))
             .build()
+
         return withContext(Dispatchers.IO) {
             client.newCall(req).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
-                    val path = url.substringAfterLast("/")
-                    debugLog?.e("Runner", "HTTP ${response.code}: $path, body=${body.take(300)}")
-                    error("HTTP ${response.code} ($path): ${body.take(300)}")
+                    debugLog?.e("Runner", "HTTP ${response.code}: ${url.substringAfterLast('/')}, body=${body.take(300)}")
+                    error("HTTP ${response.code} (${url.substringAfterLast('/')}): ${body.take(300)}")
                 }
                 val result = runCatching { jsonAdapter.fromJson(body).orEmpty() }
                     .getOrElse { error("响应解析失败：${it.message ?: body.take(300)}") }
-                debugLog?.d("Runner", "${url.substringAfterLast("/")} channel=$channel code=${result.codeInt()} msg=${result.messageText()}")
+                debugLog?.d(
+                    "Runner",
+                    "${url.substringAfterLast('/')} code=${result.codeInt()} msg=${result.messageText()}",
+                )
                 result
             }
         }
@@ -601,50 +419,95 @@ class PointsTaskRunner(
         token: String,
         userAgent: String,
         timestamp: String,
-        channel: String,
     ): okhttp3.Headers {
-        val sign = if (channel == "alipay") signzfb(timestamp, url, token) else sign(timestamp, url, token)
+        val path = url.substringAfter("https://userapi.qiekj.com")
+        val raw =
+            "appSecret=${ApiConfig.ANDROID_SECRET}&channel=${ApiConfig.API_CHANNEL}&timestamp=$timestamp&token=$token&version=${ApiConfig.VERSION}$path"
+        val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
+        val sign = digest.joinToString("") { "%02x".format(it) }
         return okhttp3.Headers.Builder()
             .add("Authorization", token)
-            .add("Version", VERSION)
-            .add("channel", channel)
-            .add("phoneBrand", "Redmi")
+            .add("Version", ApiConfig.VERSION)
+            .add("channel", ApiConfig.API_CHANNEL)
+            .add("phoneBrand", ApiConfig.PHONE_BRAND)
             .add("timestamp", timestamp)
             .add("sign", sign)
-            .add("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
+            .add("Content-Type", ApiConfig.CONTENT_TYPE)
             .add("Host", "userapi.qiekj.com")
             .add("Connection", "Keep-Alive")
-            .add("User-Agent", userAgent)
+            .add("User-Agent", userAgent.ifBlank { ApiConfig.USER_AGENT })
             .build()
     }
 
-    private fun sign(timestamp: String, url: String, token: String): String = sha256(
-        "appSecret=$ANDROID_SECRET&channel=android_app&timestamp=$timestamp&token=$token&version=$VERSION&${url.drop(25)}",
-    )
-
-    private fun signzfb(timestamp: String, url: String, token: String): String = sha256(
-        "appSecret=$ALIPAY_SECRET&channel=alipay&timestamp=$timestamp&token=$token&version=$VERSION&${url.drop(25)}",
-    )
-
-    private fun sha256(value: String): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
-        return digest.joinToString("") { "%02x".format(it) }
+    private fun markLegacyState(title: String, taskType: Int) {
+        val lower = title.lowercase()
+        when {
+            taskType == REWARD_VIDEO_TASK || taskType == REWARD_VIDEO_TASK_ALT -> setState("app_video_done", true)
+            "首页" in title -> setState("home_page_done", true)
+            "广告" in title || "视频" in title -> setState("ad_task_done", true)
+            else -> setState("other_task_done", true)
+        }
+        if ("支付宝" in title || "alipay" in lower) {
+            setState("alipay_video_task_done", true)
+        }
     }
 
-    private fun Map<String, Any?>.codeInt(): Int? = (this["code"] as? Number)?.toInt()
-    private fun Map<String, Any?>.messageText(): String = this["msg"]?.toString() ?: this["message"]?.toString() ?: "未知结果"
-    private fun Map<String, Any?>.dataMap(): Map<String, Any?> = this["data"] as? Map<String, Any?> ?: emptyMap()
+    private fun stageFor(taskType: Int, title: String): String = when {
+        taskType == REWARD_VIDEO_TASK || taskType == REWARD_VIDEO_TASK_ALT -> "app_video"
+        "支付宝" in title || title.lowercase().contains("alipay") -> "alipay_video_task"
+        "首页" in title -> "home_page"
+        "广告" in title -> "ad_task"
+        else -> "task_list"
+    }
+
+    private fun isCompletedResponse(response: Map<String, Any?>): Boolean {
+        val msg = response.messageText()
+        return msg.contains("已完成") || msg.contains("已结束") || msg.contains("已达上限") ||
+            msg.contains("次数已满") || (response.isOk() && response["data"] == false)
+    }
+
+    private fun Map<String, Any?>.isOk(): Boolean = codeInt() == 0 || codeInt() == 200
+
+    private fun Map<String, Any?>.codeInt(): Int? = this["code"].asInt()
+
+    private fun Map<String, Any?>.messageText(): String =
+        this["msg"]?.toString() ?: this["message"]?.toString() ?: "未知结果"
+
+    private fun Map<String, Any?>.dataMap(): Map<String, Any?> =
+        (this["data"] as? Map<*, *>)?.toStringMap().orEmpty()
+
+    private fun Map<String, Any?>.items(): List<Map<String, Any?>> =
+        dataMap()["items"].asMapList()
+            .ifEmpty { dataMap()["records"].asMapList() }
+            .ifEmpty { dataMap()["list"].asMapList() }
+            .ifEmpty { this["data"].asMapList() }
+
+    private fun Map<String, Any?>.rewardItems(): List<Map<String, Any?>> =
+        this["data"].asMapList()
+            .ifEmpty { dataMap()["items"].asMapList() }
+
+    private fun Map<String, Any?>.string(key: String): String? = this[key]?.toString()
+
+    private fun Map<String, Any?>.int(key: String): Int? = this[key].asInt()
+
+    private fun Map<String, Any?>.listOfMaps(key: String): List<Map<String, Any?>> =
+        this[key].asMapList()
+
+    private fun Any?.asInt(): Int? = when (this) {
+        is Number -> toInt()
+        is String -> toIntOrNull()
+        else -> null
+    }
+
+    private fun Any?.asMapList(): List<Map<String, Any?>> =
+        (this as? List<*>)?.mapNotNull { (it as? Map<*, *>)?.toStringMap() }.orEmpty()
+
+    private fun Map<*, *>.toStringMap(): Map<String, Any?> =
+        entries.associate { it.key.toString() to it.value }
 
     private companion object {
-        const val VERSION = ApiConfig.VERSION
-        const val ANDROID_SECRET = ApiConfig.ANDROID_SECRET
-        const val ALIPAY_SECRET = ApiConfig.ALIPAY_SECRET
-        val NOT_FINISH_TASKS = setOf(
-            "7328b1db-d001-4e6a-a9e6-6ae8d281ddbf",
-            "e8f837b8-4317-4bf5-89ca-99f809bf9041",
-            "65a4e35d-c8ae-4732-adb7-30f8788f2ea7",
-            "73f9f146-4b9a-4d14-9d81-3a83f1204b74",
-            "12e8c1e4-65d9-45f2-8cc1-16763e710036",
-        )
+        const val DEFAULT_SIGN_IN_ACTIVITY_ID = "600001"
+        const val REWARD_VIDEO_TASK = 637
+        const val REWARD_VIDEO_TASK_ALT = 638
     }
 }
