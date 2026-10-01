@@ -21,8 +21,8 @@ android {
         applicationId = "com.inonvation.lightlife"
         minSdk = 26
         targetSdk = 35
-        versionCode = project.findProperty("buildVersionCode")?.toString()?.toIntOrNull() ?: 12
-        versionName = "2.0.1"
+        versionCode = project.findProperty("buildVersionCode")?.toString()?.toIntOrNull() ?: 13
+        versionName = "2.0.2"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 

@@ -10,6 +10,7 @@ import com.inonvation.lightlife.data.AppRepository
 import com.inonvation.lightlife.data.BackupManager
 import com.inonvation.lightlife.data.DebugLogStore
 import com.inonvation.lightlife.data.DeviceItem
+import com.inonvation.lightlife.data.DeviceErrorDiagnosis
 import com.inonvation.lightlife.data.OrderHistoryItem
 import com.inonvation.lightlife.data.PointsStatsStore
 import com.inonvation.lightlife.data.PointsTaskRunner
@@ -27,6 +28,7 @@ import com.inonvation.lightlife.ui.theme.ColorTheme
 import com.inonvation.lightlife.ui.theme.ThemeMode
 import com.inonvation.lightlife.ui.theme.ThemePreferences
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -326,6 +328,7 @@ class AppViewModel(
 
     fun unlock(device: DeviceItem) = viewModelScope.launch {
         if (!unlockMutex.tryLock()) return@launch
+        var lastStep = "准备解锁"
         try {
             _state.update {
                 it.copy(unlocking = true, unlockingDeviceId = device.goodsName.ifBlank { device.id }, unlockStatus = "准备解锁", unlockFlowState = UnlockFlowState.PreChecking(), unlockElapsedSeconds = 0, unlockFlowHidden = false)
@@ -363,6 +366,7 @@ class AppViewModel(
             }
             runCatching {
                 repository.unlockDevice(device, usePoints = state.value.usePointsForUnlock) { step ->
+                    lastStep = step
                     val isWorking = step.contains("等待") || step.contains("设备工作") ||
                         step.contains("创建后付") || step.contains("查询订单")
                     _state.update {
@@ -378,14 +382,15 @@ class AppViewModel(
             }.onFailure { e ->
                 unlockTimerJob?.cancel()
                 unlockTimeoutJob?.cancel()
+                if (e is CancellationException) throw e
                 if (e is TokenExpiredException) {
                     _state.update { it.copy(unlocking = false, unlockStatus = null, unlockFlowState = UnlockFlowState.Idle, unlockElapsedSeconds = 0, unlockFlowHidden = false) }
                     authController.handleTokenExpired()
                     return@launch
                 }
-                val diag = if (e is UnlockException) e.diagnosis else null
-                val failState = if (diag != null) UnlockFlowState.Failed(diag.primaryReason, diag.step, diag.rawError, diag.suggestions)
-                    else UnlockFlowState.Failed(e.message ?: "未知错误", "未知", e.message ?: "")
+                val diag = if (e is UnlockException) e.diagnosis
+                    else DeviceErrorDiagnosis.diagnose(null, e.message, lastStep)
+                val failState = UnlockFlowState.Failed(diag.primaryReason, diag.step, diag.rawError, diag.suggestions)
                 _state.update { it.copy(unlocking = false, unlockStatus = null, unlockFlowState = failState, unlockElapsedSeconds = 0, unlockFlowHidden = false) }
             }
         } finally {

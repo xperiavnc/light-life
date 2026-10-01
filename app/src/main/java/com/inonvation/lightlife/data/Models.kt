@@ -8,7 +8,19 @@ data class ApiEnvelope<T>(
     val message: String? = null,
     val data: T? = null,
 ) {
+    fun requireSuccess() {
+        if (code != null && code != 0 && code != 200) {
+            val rawMsg = message?.takeIf { it.isNotBlank() }
+                ?: msg?.takeIf { it.isNotBlank() } ?: "请求失败"
+            if (TokenExpiredException.isTokenExpired(code, rawMsg)) {
+                throw TokenExpiredException(rawMsg)
+            }
+            throw ApiBusinessException(code, rawMsg)
+        }
+    }
+
     fun requireData(): T {
+        requireSuccess()
         if (data != null) return data
         val rawMsg = message ?: msg ?: "接口未返回 data"
         if (TokenExpiredException.isTokenExpired(code, rawMsg)) {
@@ -17,6 +29,8 @@ data class ApiEnvelope<T>(
         error(rawMsg)
     }
 }
+
+class ApiBusinessException(val code: Int, message: String) : IllegalStateException(message)
 
 data class EmptyData(
     val ignored: String? = null,

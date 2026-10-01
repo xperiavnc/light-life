@@ -1,5 +1,6 @@
 ﻿package com.inonvation.lightlife.data
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
@@ -71,6 +72,14 @@ class AppRepository(
         device: DeviceItem,
         usePoints: Boolean = true,
         onStep: suspend (String) -> Unit,
+    ): UnlockResult = UnlockStepTracker(onStep).run {
+        performUnlock(device, usePoints, this::report)
+    }
+
+    private suspend fun performUnlock(
+        device: DeviceItem,
+        usePoints: Boolean,
+        onStep: suspend (String) -> Unit,
     ): UnlockResult {
         val token = requireToken()
         val goodsId = device.goodsId ?: device.id ?: error("设备缺少 goodsId")
@@ -82,8 +91,9 @@ class AppRepository(
 
         onStep("正在检测设备状态")
         runCatching {
-            api.syncWater(skuId = skuId, token = token)
+            api.syncWater(skuId = skuId, token = token).requireSuccess()
         }.getOrElse { e ->
+            if (e is CancellationException || e is TokenExpiredException) throw e
             // 预检失败不阻断流程，但记录原因以便排查
             debugLog?.e("Repo", "syncWater 预检失败（不阻断）：${e.message}")
         }
@@ -178,11 +188,7 @@ class AppRepository(
 
 
     private fun throwDiagnosed(original: Throwable, step: String): Nothing {
-        val code = if (original.message?.matches(Regex("HTTP \\d+.*")) == true) {
-            original.message?.substringAfter("HTTP ")?.substringBefore(":")?.trim()?.toIntOrNull()
-        } else null
-        val diagnosis = DeviceErrorDiagnosis.diagnose(code, original.message, step)
-        throw UnlockException(diagnosis.primaryReason, diagnosis, original)
+        UnlockStepTracker.rethrow(original, step)
     }
 
     private fun requireToken(): String = tokenStore.readToken()?.takeIf { it.isNotBlank() }
@@ -190,13 +196,7 @@ class AppRepository(
 
     private fun ApiEnvelope<*>.throwIfFailed() {
         debugLog?.d("Repo", "throwIfFailed: code=$code, msg=${msg ?: message}")
-        if (code != null && code != 0 && code != 200) {
-            val errorMsg = message ?: msg ?: "请求失败"
-            if (TokenExpiredException.isTokenExpired(code, errorMsg)) {
-                throw TokenExpiredException(errorMsg)
-            }
-            error(errorMsg)
-        }
+        requireSuccess()
     }
 
     suspend fun validateToken() {

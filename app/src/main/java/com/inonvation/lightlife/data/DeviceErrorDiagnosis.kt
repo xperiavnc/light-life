@@ -15,6 +15,17 @@ object DeviceErrorDiagnosis {
         val codeVal = code ?: -1
 
         val (reason, suggestions) = when {
+            msg.contains("expected begin_") || msg.contains("jsondataexception") ||
+                msg.contains("响应数据格式") ->
+                "接口返回的数据格式不兼容" to listOf(
+                    "更新本应用后重试",
+                    "反馈失败步骤及原始错误，便于核对接口响应",
+                )
+            msg.contains("版本过低") || msg.contains("升级app") ->
+                "服务器要求升级官方客户端" to listOf(
+                    "升级胖乖生活 App 后确认设备可正常使用",
+                )
+
             // 积分风控
             msg.contains("积分") && (msg.contains("拦截") || msg.contains("风控") || msg.contains("风险")) ->
                 "积分使用权限未开通" to listOf(
@@ -87,7 +98,9 @@ object DeviceErrorDiagnosis {
         }
 
         return DiagnosisResult(
-            primaryReason = reason ?: "未知错误（code: $codeVal）",
+            primaryReason = reason ?: message?.takeIf { it.isNotBlank() }?.let {
+                if (code != null) "请求失败（code: $codeVal）：$it" else it
+            } ?: "未知错误（code: $codeVal）",
             rawError = raw,
             step = step,
             suggestions = suggestions,

@@ -6,6 +6,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 object MoshiProvider {
     val instance: Moshi by lazy {
         Moshi.Builder()
+            .add(ApiEnvelopeJsonAdapterFactory())
             .add(EmptyDataJsonAdapter())
             .add(LenientStringJsonAdapter())
             .add(KotlinJsonAdapterFactory())
