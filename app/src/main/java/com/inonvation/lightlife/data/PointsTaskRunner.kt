@@ -200,8 +200,8 @@ class PointsTaskRunner(
 
     /**
      * Reads the current task catalogue and dispatches by the server-provided
-     * task type. 637/638 are the reward-video task types used by the supplied
-     * official client; all other task types use task/completed.
+     * task type. The supplied official client defines task types 1 and 2 as
+     * reward-video tasks; all other task types use task/completed.
      */
     private suspend fun runOfficialTaskList(
         token: String,
@@ -232,6 +232,8 @@ class PointsTaskRunner(
         var currentBalance = initialBalance
         var completedTasks = 0
         var visibleTasks = 0
+        var encodedUserId: String? = null
+        var encodedUserIdLookupAttempted = false
 
         for (item in items) {
             checkCancelled()
@@ -258,9 +260,49 @@ class PointsTaskRunner(
             var taskCompleted = false
 
             if (taskType == REWARD_VIDEO_TASK || taskType == REWARD_VIDEO_TASK_ALT) {
-                repeat(remaining) { index ->
+                val adId = item.rewardVideoAdId()
+                if (adId.isNullOrBlank()) {
+                    log("$title：缺少官方广告位，跳过领奖")
+                    maybeDelay(log)
+                    continue
+                }
+
+                if (!encodedUserIdLookupAttempted) {
+                    encodedUserIdLookupAttempted = true
+                    encodedUserId = runCatching {
+                        request(
+                            url = "https://userapi.qiekj.com/user/getEncodeUserId",
+                            token = token,
+                            userAgent = ua,
+                            fields = emptyMap(),
+                        )
+                    }.onFailure {
+                        log("获取广告用户编码失败：${it.message ?: "未知错误"}")
+                    }.getOrNull()
+                        ?.takeIf { it.isOk() }
+                        ?.dataString()
+                        ?.takeIf { it.isNotBlank() }
+                    if (encodedUserId.isNullOrBlank()) {
+                        log("$title：未获取到广告用户编码，跳过领奖")
+                        maybeDelay(log)
+                        continue
+                    }
+                }
+
+                for (index in 0 until remaining) {
                     checkCancelled()
                     waitIfPaused(log)
+                    log("$title 第${index + 1}/$remaining 次：展示激励广告...")
+                    val adRewarded = RewardVideoGateway.showCurrent(
+                        adId = adId,
+                        encodedUserId = encodedUserId.orEmpty(),
+                        taskCode = taskCode,
+                    )
+                    if (!adRewarded) {
+                        log("$title 第${index + 1}/$remaining 次未完成：广告未返回有效奖励，未调用领奖接口")
+                        break
+                    }
+
                     val reward = request(
                         url = "https://userapi.qiekj.com/task/getTaskReward",
                         token = token,
@@ -272,17 +314,20 @@ class PointsTaskRunner(
                         val amount = rewards.firstOrNull()?.let { firstReward ->
                             firstReward.int("awardNumber")
                                 ?: firstReward.int("awardAmount")
+                        } ?: reward.rewardAmount()
+                        if (amount != null && amount > 0) {
+                            log("$title 第${index + 1}/$remaining 次完成，获得 $amount 分")
+                            taskCompleted = true
+                        } else {
+                            log("$title 第${index + 1}/$remaining 次领奖接口成功，但奖励列表为空")
                         }
-                        val suffix = amount?.let { "，获得 $it 分" }.orEmpty()
-                        log("$title 第${index + 1}/$remaining 次完成$suffix")
-                        taskCompleted = true
                     } else if (isCompletedResponse(reward)) {
                         log("$title：服务器已记录完成")
                         taskCompleted = true
-                        return@repeat
+                        break
                     } else {
                         log("$title 第${index + 1}/$remaining 次失败：${reward.messageText()}")
-                        return@repeat
+                        break
                     }
                     onProgress?.invoke(stage, index + 1, remaining)
                     maybeDelay(log)
@@ -379,6 +424,16 @@ class PointsTaskRunner(
             fields = emptyMap(),
         )
         return res.dataMap()["integral"].asInt()
+    }
+
+    private fun Map<String, Any?>.rewardVideoAdId(): String? {
+        val extendMap = this["extendMap"].asStringMap()
+        val v180 = extendMap?.get("v180").asStringMap()
+        val android = v180?.get("android").asStringMap()
+        return android?.string("gromoreId")
+            ?.takeIf { it.isNotBlank() }
+            ?: android?.string("newGromoreId")?.takeIf { it.isNotBlank() }
+            ?: this.string("gromoreId")?.takeIf { it.isNotBlank() }
     }
 
     private suspend fun request(
@@ -488,6 +543,18 @@ class PointsTaskRunner(
         this["data"].asMapList()
             .ifEmpty { dataMap()["items"].asMapList() }
 
+    private fun Map<String, Any?>.rewardAmount(): Int? =
+        dataMap()["awardNumber"].asInt()
+            ?: dataMap()["awardAmount"].asInt()
+            ?: this["awardNumber"].asInt()
+            ?: this["awardAmount"].asInt()
+
+    private fun Map<String, Any?>.dataString(): String? = when (val value = this["data"]) {
+        is String -> value
+        is Number -> value.toString()
+        else -> null
+    }
+
     private fun Map<String, Any?>.string(key: String): String? = this[key]?.toString()
 
     private fun Map<String, Any?>.int(key: String): Int? = this[key].asInt()
@@ -504,12 +571,15 @@ class PointsTaskRunner(
     private fun Any?.asMapList(): List<Map<String, Any?>> =
         (this as? List<*>)?.mapNotNull { (it as? Map<*, *>)?.toStringMap() }.orEmpty()
 
+    private fun Any?.asStringMap(): Map<String, Any?>? =
+        (this as? Map<*, *>)?.toStringMap()
+
     private fun Map<*, *>.toStringMap(): Map<String, Any?> =
         entries.associate { it.key.toString() to it.value }
 
     private companion object {
         const val DEFAULT_SIGN_IN_ACTIVITY_ID = "600001"
-        const val REWARD_VIDEO_TASK = 637
-        const val REWARD_VIDEO_TASK_ALT = 638
+        const val REWARD_VIDEO_TASK = 1
+        const val REWARD_VIDEO_TASK_ALT = 2
     }
 }
