@@ -51,6 +51,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -104,6 +105,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -325,28 +327,32 @@ private fun DeviceControlApp(vm: AppViewModel) {
     val initialPage = tabList.indexOf(state.currentTab).coerceAtLeast(0)
     val pagerState = rememberPagerState(initialPage = initialPage) { tabList.size }
 
-    // 程序驱动翻页时禁止反向同步，避免 animateScrollToPage 过程中 currentPage 变化引发循环冲突
-    var isAnimatingToPage by remember { mutableStateOf(false) }
+    // 只在动画完成后同步 Tab，避免快速点击或拖动过程中 currentPage 的中间值反复
+    // 写回 ViewModel，造成动画互相取消、重复重组和页面抖动。
+    val selectedTab by rememberUpdatedState(state.currentTab)
 
-    // 点击 tab 触发动画切页
-    LaunchedEffect(state.currentTab) {
+    // 点击 tab 触发动画切页。以 settledPage 判断是否已经到位，避免动画被
+    // 快速点击打断后 currentPage 恰好等于目标页、但仍有残余偏移时跳过补偿动画。
+    LaunchedEffect(state.currentTab, tabList, pagerState) {
         val target = tabList.indexOf(state.currentTab)
-        if (target >= 0 && pagerState.currentPage != target) {
-            isAnimatingToPage = true
-            pagerState.animateScrollToPage(target, animationSpec = tween(300, easing = FastOutSlowInEasing))
-            isAnimatingToPage = false
+        if (target >= 0 && pagerState.settledPage != target) {
+            pagerState.animateScrollToPage(
+                target,
+                animationSpec = tween(260, easing = FastOutSlowInEasing),
+            )
         }
     }
 
-    // 滑动 pager 时同步更新 currentTab（反向同步）
-    LaunchedEffect(pagerState) {
-        snapshotFlow { pagerState.currentPage }
+    // 滑动 pager 时只在 settledPage 变化后同步 currentTab（反向同步）。
+    // rememberUpdatedState 保证这里拿到最新选中的 Tab，而不是 LaunchedEffect
+    // 首次启动时捕获的旧 state。
+    LaunchedEffect(pagerState, tabList) {
+        snapshotFlow { pagerState.settledPage }
+            .distinctUntilChanged()
             .collect { page ->
-                if (!isAnimatingToPage) {
-                    val newTab = tabList[page]
-                    if (newTab != state.currentTab) {
-                        vm.selectTab(newTab)
-                    }
+                val newTab = tabList.getOrNull(page) ?: return@collect
+                if (newTab != selectedTab) {
+                    vm.selectTab(newTab)
                 }
             }
     }
@@ -406,7 +412,8 @@ private fun DeviceControlApp(vm: AppViewModel) {
                     state = pagerState,
                     modifier = Modifier
                         .weight(1f),
-                    beyondViewportPageCount = 1,
+                    key = { page -> tabList[page] },
+                    beyondViewportPageCount = 0,
                     userScrollEnabled = true,
                 ) { page ->
                     when (tabList[page]) {
