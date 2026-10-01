@@ -1,12 +1,14 @@
 package com.inonvation.lightlife.data
 
 import android.content.Context
+import com.inonvation.lightlife.BuildConfig
 import com.squareup.moshi.JsonAdapter
 import com.squareup.moshi.Types
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.security.MessageDigest
 import kotlin.jvm.Volatile
@@ -26,6 +28,7 @@ class PointsTaskRunner(
     private val tokenProvider: () -> String?,
     private val context: Context? = null,
     private val pointsStatsStore: PointsStatsStore? = null,
+    private val client: OkHttpClient = HttpClientProvider.client,
 ) {
     @Volatile
     var cancelled = false
@@ -45,7 +48,6 @@ class PointsTaskRunner(
     /** stage / current / total, consumed by the foreground service. */
     var onProgress: ((stage: String, current: Int, total: Int) -> Unit)? = null
 
-    private val client = HttpClientProvider.client
     private val jsonAdapter: JsonAdapter<Map<String, Any?>> = MoshiProvider.instance
         .adapter(Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java))
 
@@ -94,6 +96,10 @@ class PointsTaskRunner(
         checkCancelled()
         waitIfPaused(log)
         val token = tokenProvider()?.takeIf { it.isNotBlank() } ?: error("请先在我的页面登录")
+        log(
+            "客户端：${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) " +
+                "${BuildConfig.BUILD_TYPE} / ${TaskResponseDiagnostics.REVISION}",
+        )
 
         val user = request(
             url = "https://userapi.qiekj.com/user/info",
@@ -110,7 +116,10 @@ class PointsTaskRunner(
 
         if (!getState("signin_done")) {
             val activityId = resolveSignInActivityId(token, userAgent, log)
-            signIn(token, userAgent, activityId, log)
+            if (!signIn(token, userAgent, activityId, log)) {
+                log("服务器要求升级官方客户端，本轮停止任务提交；本地版本号不代表服务端兼容性")
+                return
+            }
             lastBalance = logBalanceDelta("签到", token, userAgent, lastBalance, log)
         } else {
             log("签到：已跳过")
@@ -121,9 +130,13 @@ class PointsTaskRunner(
         checkCancelled()
         lastBalance = runOfficialTaskList(token, userAgent, log, lastBalance)
 
-        val after = balance(token, userAgent) ?: lastBalance
+        val after = balance(token, userAgent)
         val earned = if (after != null && initialBalance != null) after - initialBalance else null
-        log("任务完成，当前积分：${after ?: "-"}（今日 +${earned ?: 0}）")
+        val earnedLabel = earned?.let { if (it >= 0) "+$it" else it.toString() } ?: "未核验"
+        val balanceLabel = after?.toString()
+            ?: lastBalance?.let { "未核验，上次读取 $it" }
+            ?: "-"
+        log("任务流程结束，当前积分：$balanceLabel（本轮 $earnedLabel）")
         if (earned != null && earned > 0) {
             pointsStatsStore?.addTodayEarned(earned)
         }
@@ -149,7 +162,7 @@ class PointsTaskRunner(
             ?.takeIf { it.isNotBlank() }
             ?: response.dataMap()["activityId"]?.toString()
                 ?.takeIf { it.isNotBlank() }
-        if (response.isOk() && activityId != null) {
+        if (response.isAccepted() && activityId != null) {
             return activityId
         }
         log("签到活动未返回有效活动号，使用兼容活动号：$DEFAULT_SIGN_IN_ACTIVITY_ID")
@@ -161,7 +174,7 @@ class PointsTaskRunner(
         ua: String,
         activityId: String,
         log: suspend (String) -> Unit,
-    ) {
+    ): Boolean {
         log("开始执行签到...")
         val res = request(
             url = "https://userapi.qiekj.com/signin/doUserSignIn",
@@ -169,8 +182,12 @@ class PointsTaskRunner(
             userAgent = ua,
             fields = mapOf("activityId" to activityId),
         )
+        if (TaskResponseDiagnostics.requiresClientUpgrade(res)) {
+            log("签到请求未成功：${res.diagnosticSummary()}")
+            return false
+        }
         when {
-            res.isOk() -> {
+            res.isAccepted() -> {
                 log("签到成功，当前积分：${res.dataMap()["totalIntegral"] ?: "-"}")
                 setState("signin_done", true)
                 onProgress?.invoke("signin", 1, 1)
@@ -180,8 +197,9 @@ class PointsTaskRunner(
                 setState("signin_done", true)
                 onProgress?.invoke("signin", 1, 1)
             }
-            else -> log("签到失败：${res.messageText()}")
+            else -> log("签到请求未成功：${res.diagnosticSummary()}")
         }
+        return !TaskResponseDiagnostics.requiresClientUpgrade(res)
     }
 
     private suspend fun shieldingQuery(
@@ -217,8 +235,8 @@ class PointsTaskRunner(
             userAgent = ua,
             fields = emptyMap(),
         )
-        if (!listResponse.isOk()) {
-            log("获取任务列表失败：${listResponse.messageText()}")
+        if (!listResponse.isAccepted()) {
+            log("获取任务列表失败：${listResponse.diagnosticSummary()}")
             return initialBalance
         }
 
@@ -256,6 +274,7 @@ class PointsTaskRunner(
             }
 
             log("开始执行：$title（$completedFreq/$dailyLimit）")
+            log("$title：taskType=$taskType，分支=${if (taskType == REWARD_VIDEO_TASK || taskType == REWARD_VIDEO_TASK_ALT) "激励视频" else "普通任务"}")
             val subtasks = item.listOfMaps("subtaskList")
             var taskCompleted = false
 
@@ -310,7 +329,7 @@ class PointsTaskRunner(
                         fields = mapOf("taskCode" to taskCode),
                     )
                     val rewards = reward.rewardItems()
-                    if (reward.isOk()) {
+                    if (reward.isAccepted()) {
                         val amount = rewards.firstOrNull()?.let { firstReward ->
                             firstReward.int("awardNumber")
                                 ?: firstReward.int("awardAmount")
@@ -319,14 +338,19 @@ class PointsTaskRunner(
                             log("$title 第${index + 1}/$remaining 次完成，获得 $amount 分")
                             taskCompleted = true
                         } else {
-                            log("$title 第${index + 1}/$remaining 次领奖接口成功，但奖励列表为空")
+                            log("$title 第${index + 1}/$remaining 次接口已受理，但未返回奖励；停止后续请求（${reward.diagnosticSummary()}）")
+                            break
                         }
                     } else if (isCompletedResponse(reward)) {
                         log("$title：服务器已记录完成")
                         taskCompleted = true
                         break
                     } else {
-                        log("$title 第${index + 1}/$remaining 次失败：${reward.messageText()}")
+                        log("$title 第${index + 1}/$remaining 次请求未成功：${reward.diagnosticSummary()}；停止该任务后续请求")
+                        if (TaskResponseDiagnostics.requiresClientUpgrade(reward)) {
+                            log("服务器要求升级官方客户端，本轮停止任务提交")
+                            return currentBalance
+                        }
                         break
                     }
                     onProgress?.invoke(stage, index + 1, remaining)
@@ -343,26 +367,35 @@ class PointsTaskRunner(
                         ?: continue
                     val result = completeTask(token, ua, taskCode, subtaskCode)
                     subIndex++
-                    if (result.isOk() || isCompletedResponse(result)) {
+                    if (result.isAccepted() || isCompletedResponse(result)) {
                         taskCompleted = true
-                        log("$title 子任务 $subIndex 完成")
+                        log("$title 子任务 $subIndex 接口已受理，奖励以余额核验为准")
                     } else {
-                        log("$title 子任务 $subIndex 失败：${result.messageText()}")
+                        log("$title 子任务 $subIndex 请求未成功：${result.diagnosticSummary()}；停止该任务后续请求")
+                        if (TaskResponseDiagnostics.requiresClientUpgrade(result)) {
+                            log("服务器要求升级官方客户端，本轮停止任务提交")
+                            return currentBalance
+                        }
+                        break
                     }
                     onProgress?.invoke(stage, subIndex, subtasks.size)
                     maybeDelay(log)
                 }
             } else {
-                repeat(remaining) { index ->
+                for (index in 0 until remaining) {
                     checkCancelled()
                     waitIfPaused(log)
                     val result = completeTask(token, ua, taskCode, null)
-                    if (result.isOk() || isCompletedResponse(result)) {
+                    if (result.isAccepted() || isCompletedResponse(result)) {
                         taskCompleted = true
-                        log("$title 第${index + 1}/$remaining 次完成")
+                        log("$title 第${index + 1}/$remaining 次接口已受理，奖励以余额核验为准")
                     } else {
-                        log("$title 第${index + 1}/$remaining 次失败：${result.messageText()}")
-                        return@repeat
+                        log("$title 第${index + 1}/$remaining 次请求未成功：${result.diagnosticSummary()}；停止该任务后续请求")
+                        if (TaskResponseDiagnostics.requiresClientUpgrade(result)) {
+                            log("服务器要求升级官方客户端，本轮停止任务提交")
+                            return currentBalance
+                        }
+                        break
                     }
                     onProgress?.invoke(stage, index + 1, remaining)
                     maybeDelay(log)
@@ -378,7 +411,7 @@ class PointsTaskRunner(
         }
 
         setState("tasklist_done", true)
-        log("任务列表处理完成：$completedTasks/$visibleTasks 项")
+        log("任务列表处理结束，接口已受理/已记录：$completedTasks/$visibleTasks 项（不代表全部奖励已到账）")
         return currentBalance
     }
 
@@ -423,7 +456,7 @@ class PointsTaskRunner(
             userAgent = ua,
             fields = emptyMap(),
         )
-        return res.dataMap()["integral"].asInt()
+        return res.takeIf { it.isAccepted() }?.dataMap()?.get("integral").asInt()
     }
 
     private fun Map<String, Any?>.rewardVideoAdId(): String? {
@@ -464,7 +497,7 @@ class PointsTaskRunner(
                     .getOrElse { error("响应解析失败：${it.message ?: body.take(300)}") }
                 debugLog?.d(
                     "Runner",
-                    "${url.substringAfterLast('/')} code=${result.codeInt()} msg=${result.messageText()}",
+                    "${url.substringAfterLast('/')} HTTP=${response.code} ${result.diagnosticSummary()}",
                 )
                 result
             }
@@ -517,18 +550,19 @@ class PointsTaskRunner(
         else -> "task_list"
     }
 
-    private fun isCompletedResponse(response: Map<String, Any?>): Boolean {
-        val msg = response.messageText()
-        return msg.contains("已完成") || msg.contains("已结束") || msg.contains("已达上限") ||
-            msg.contains("次数已满") || (response.isOk() && response["data"] == false)
-    }
+    private fun isCompletedResponse(response: Map<String, Any?>): Boolean =
+        TaskResponseDiagnostics.isCompletionRecorded(response)
 
-    private fun Map<String, Any?>.isOk(): Boolean = codeInt() == 0 || codeInt() == 200
+    private fun Map<String, Any?>.isOk(): Boolean = TaskResponseDiagnostics.isOk(this)
 
-    private fun Map<String, Any?>.codeInt(): Int? = this["code"].asInt()
+    private fun Map<String, Any?>.isAccepted(): Boolean = TaskResponseDiagnostics.isAccepted(this)
+
+    private fun Map<String, Any?>.codeInt(): Int? = TaskResponseDiagnostics.code(this)
 
     private fun Map<String, Any?>.messageText(): String =
-        this["msg"]?.toString() ?: this["message"]?.toString() ?: "未知结果"
+        TaskResponseDiagnostics.message(this)
+
+    private fun Map<String, Any?>.diagnosticSummary(): String = TaskResponseDiagnostics.summary(this)
 
     private fun Map<String, Any?>.dataMap(): Map<String, Any?> =
         (this["data"] as? Map<*, *>)?.toStringMap().orEmpty()
